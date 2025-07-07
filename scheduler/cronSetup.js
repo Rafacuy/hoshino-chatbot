@@ -3,94 +3,103 @@ const schedule = require("node-schedule");
 const logger = require("../utils/logger");
 const memory = require("../data/memory");
 const { getWeatherData, getWeatherString, getWeatherReminder } = require("../modules/weather");
-const Mood = require("../modules/mood"); 
-const { sendMessage } = require('../utils/sendMessage')
+const Mood = require("../modules/mood");
+const { isFeatureEnabled } = require("../config/featureConfig");
+const { sendMessage } = require("../utils/sendMessage");
 const newsManager = require("../modules/newsManager");
 const holidaysModule = require("../handler/holidayHandlers");
 const sendSadSongNotification = require("../utils/songNotifier");
 const relationState = require("../handler/relationHandler");
-const config = require("../config/config"); // Untuk mendapatkan TARGET_CHAT_ID dan calendarificApiKey
+const config = require("../config/config"); // To get TARGET_CHAT_ID and calendarificApiKey
 const chatSummarizer = require("../modules/chatSummarizer");
 const globalState = require("../state/globalState"); // Import globalState
 
 /**
  * @function setupCronJobs
- * @description Menyiapkan semua pekerjaan cron terjadwal untuk aplikasi Lumina.
- * Ini termasuk pembaruan cuaca, pembersihan LTM, pengecekan relasi, notifikasi lagu sedih,
- * berita harian, pengingat memori, pembaruan mode berbasis waktu, ringkasan obrolan,
- * dan pengecekan status 'ngambek'.
- * @param {object} bot - Instance bot Telegram.
- * @param {function} updateTimeBasedModes - Fungsi untuk memperbarui mode berbasis waktu.
- * @param {function} checkNgambekStatus - Fungsi untuk memeriksa dan memperbarui status 'ngambek'.
- * @param {string} USER_NAME - Nama pengguna Lumina.
- * @param {object} Sentry - Objek Sentry untuk pelacakan kesalahan.
+ * @description Sets up all scheduled cron jobs for the application.
+ * This includes weather updates, LTM cleanup, relationship checks, song notifications,
+ * daily news, time-based mode updates, chat summarization,
+ * and sulk status checks.
+ * @param {object} bot - The Telegram bot instance.
+ * @param {function} updateTimeBasedModes - Function to update time-based modes.
+ * @param {function} checkNgambekStatus - Function to check and update the 'sulk' status.
+ * @param {string} USER_NAME - The user's name.
+ * @param {object} configuredChatId - The ChatID to send notifications to.
+ * @param {object} Sentry - The Sentry object for error tracking.
  */
 const setupCronJobs = (
   bot,
   updateTimeBasedModes,
   checkNgambekStatus,
   USER_NAME,
-  Sentry
+  configuredChatId,
+  Sentry,
 ) => {
-  const configuredChatId = config.TARGET_CHAT_ID || config.chatId;
-
   if (!configuredChatId) {
     logger.warn(
-      "⚠️ TARGET_CHAT_ID tidak ditemukan di config.js. Pesan terjadwal TIDAK akan dikirim."
+      "⚠️ TARGET_CHAT_ID not found in config.js. Scheduled messages will NOT be sent."
     );
     return;
   }
 
   logger.info(
-    `📬 Pesan terjadwal akan dikirim ke ID obrolan: ${configuredChatId}`
+    `📬 Scheduled messages will be sent to chat ID: ${configuredChatId}`
   );
 
-  // Pekerjaan cron untuk laporan cuaca (setiap 5 jam)
-  schedule.scheduleJob(
-    { rule: "0 */5 * * *", tz: "Asia/Jakarta" },
-    async () => {
-      try {
-        const weather = await getWeatherData();
-        if (weather) {
-          sendMessage(
-            configuredChatId,
-            `🌸 Cuaca hari ini:\n${getWeatherString(
-              weather
-            )}\n${getWeatherReminder(weather)}`
+  // Cron job for weather reports (every 5 hours)
+  // FF-CHECK: This job is guarded by its feature flag.
+  if (isFeatureEnabled('ENABLE_WEATHER_REMINDER')) {
+    schedule.scheduleJob(
+      { rule: "0 */5 * * *", tz: "Asia/Jakarta" },
+      async () => {
+        try {
+          const weather = await getWeatherData();
+          if (weather) {
+            sendMessage(
+              configuredChatId,
+              `🌸 Cuaca hari ini:\n${getWeatherString(
+                weather
+              )}\n${getWeatherReminder(weather)}`
+            );
+            logger.info(
+              { event: "weather_report_sent", chatId: configuredChatId },
+              "Weather report sent successfully."
+            );
+          } else {
+            sendMessage(
+              configuredChatId,
+              `Hmm.. Kayaknya Lumina nggak nemu data cuaca hari ini deh.. ${Mood.SAD.emoji}`
+            );
+            logger.warn(
+              { event: "weather_report_failed", chatId: configuredChatId },
+              "Failed to fetch weather data."
+            );
+          }
+        } catch (error) {
+          logger.error(
+            {
+              event: "scheduled_weather_error",
+              error: error.message,
+              stack: error.stack,
+            },
+            "Error during scheduled weather task:"
           );
-          logger.info(
-            { event: "weather_report_sent", chatId: configuredChatId },
-            "Laporan cuaca dikirim."
-          );
-        } else {
-          sendMessage(
-            configuredChatId,
-            `Hmm... Lumina sedang tidak dapat mengambil data cuaca. ${Mood.SAD.emoji}`
-          );
-          logger.warn(
-            { event: "weather_report_failed", chatId: configuredChatId },
-            "Gagal mengambil data cuaca."
-          );
+          Sentry.captureException(error);
         }
-      } catch (error) {
-        logger.error(
-          {
-            event: "scheduled_weather_error",
-            error: error.message,
-            stack: error.stack,
-          },
-          "Kesalahan saat penjadwalan cuaca:"
-        );
-        Sentry.captureException(error);
       }
-    }
-  );
+    );
+  } else {
+    logger.info(
+      { event: "weather_reminder_disabled" },
+      "FF-CHECK: Weather reminder job is disabled by feature flag."
+    );
+  }
 
-  // Pembersihan LTM setiap 2 bulan (60 hari)
+  // LTM cleanup every 2 months (60 days)
   schedule.scheduleJob(
     { rule: "0 0 1 */2 *", tz: "Asia/Jakarta" },
     async () => {
-      logger.info("Running LTM cleanup...");
+      logger.info("Running LTM cleanup job...");
       try {
         const allPrefs = await memory.getLongTermMemory();
         const twoMonthsAgo = Date.now() - 60 * 24 * 60 * 60 * 1000;
@@ -105,19 +114,19 @@ const setupCronJobs = (
             }
           }
         }
-        logger.info(`Cleaned up ${count} old LTM entries`);
+        logger.info(`Cleaned up ${count} old LTM entries.`);
       } catch (error) {
-        logger.error({ error: error.message }, "LTM cleanup failed");
+        logger.error({ error: error.message }, "LTM cleanup failed.");
         Sentry.captureException(error);
       }
     }
   );
 
-  // Cek relasi setiap 7 jam
+  // Relationship check every 7 hours
   schedule.scheduleJob({ rule: "0 */7 * * *" }, async () => {
     logger.info(
       { event: "relation_status_check_scheduled" },
-      "Menjalankan pengecekan status relasi terjadwal..."
+      "Running scheduled relationship status check..."
     );
     try {
       await relationState.checkWeeklyConversation();
@@ -128,58 +137,74 @@ const setupCronJobs = (
           error: error.message,
           stack: error.stack,
         },
-        "Kesalahan saat pengecekan relasi terjaduk:"
+        "Error during scheduled relationship check:"
       );
       Sentry.captureException(error);
     }
   });
-
-  // Rekomendasi lagu sedih setiap jam 10 malam
-  schedule.scheduleJob({ rule: "0 22 * * *", tz: "Asia/Jakarta" }, () => {
-    try {
-      sendSadSongNotification(configuredChatId);
-      logger.info(
-        { event: "sad_song_notification_sent", chatId: configuredChatId },
-        "Notifikasi lagu sedih dikirim."
-      );
-    } catch (error) {
-      logger.error(
-        {
-          event: "scheduled_song_notification_error",
-          error: error.message,
-          stack: error.stack,
-        },
-        "Kesalahan saat penjadwalan notifikasi lagu sedih:"
-      );
-      Sentry.captureException(error);
-    }
-  });
-
-  // Berita & ringkasannya setiap jam 8 pagi
-  schedule.scheduleJob(
-    { rule: "0 8 * * *", tz: "Asia/Jakarta" },
-    async () => {
-      logger.info(
-        { event: "daily_news_send_scheduled" },
-        "[Core] Menjalankan pengiriman berita harian terjadwal..."
-      );
+  
+  // Sad song recommendation every night at 10 PM
+  // FF-CHECK: This job is guarded by its feature flag.
+  if (isFeatureEnabled('ENABLE_SONGS_NOTIFIER')) {
+    schedule.scheduleJob({ rule: "0 22 * * *", tz: "Asia/Jakarta" }, () => {
       try {
-        await newsManager.sendDailyNews(configuredChatId);
+        sendSadSongNotification(configuredChatId);
+        logger.info(
+          { event: "sad_song_notification_sent", chatId: configuredChatId },
+          "Sad song notification sent."
+        );
       } catch (error) {
         logger.error(
           {
-            event: "scheduled_daily_news_error",
+            event: "scheduled_song_notification_error",
             error: error.message,
             stack: error.stack,
           },
-          "Kesalahan saat penjadwalan berita harian:"
+          "Error during scheduled song notification:"
         );
         Sentry.captureException(error);
       }
-    }
-  );
+    });
+  } else {
+    logger.info(
+      { event: "songs_notifier_disabled" },
+      "FF-CHECK: Song notifier job is disabled by feature flag."
+    );
+  }
 
-  // Pembaruan mode berbasis waktu setiap jam
+  // Daily news and summary every morning at 8 AM
+  // FF-CHECK: This job is guarded by its feature flag.
+  if (isFeatureEnabled('ENABLE_DAILY_NEWS')) {
+    schedule.scheduleJob(
+      { rule: "0 8 * * *", tz: "Asia/Jakarta" },
+      async () => {
+        logger.info(
+          { event: "daily_news_send_scheduled" },
+          "[Core] Running scheduled daily news delivery..."
+        );
+        try {
+          await newsManager.sendDailyNews(configuredChatId);
+        } catch (error) {
+          logger.error(
+            {
+              event: "scheduled_daily_news_error",
+              error: error.message,
+              stack: error.stack,
+            },
+            "Error during scheduled daily news task:"
+          );
+          Sentry.captureException(error);
+        }
+      }
+    );
+  } else {
+    logger.info(
+      { event: "daily_news_disabled" },
+      "FF-CHECK: Daily news job is disabled by feature flag."
+    );
+  }
+
+  // Time-based mode update every hour
   schedule.scheduleJob({ rule: "0 * * * *", tz: "Asia/Jakarta" }, () => {
     try {
       updateTimeBasedModes(configuredChatId);
@@ -190,19 +215,19 @@ const setupCronJobs = (
           error: error.message,
           stack: error.stack,
         },
-        "Kesalahan saat penjadwalan pembaruan mode berbasis waktu:"
+        "Error during scheduled time-based mode update:"
       );
       Sentry.captureException(error);
     }
   });
 
-  // Pembaruan ringkasan obrolan setiap jam
+  // Chat summary update every hour
   schedule.scheduleJob(
     { rule: "0 * * * *", tz: "Asia/Jakarta" },
     async () => {
       logger.info(
         { event: "update_chat_summary_start" },
-        "[Core] Memperbarui ringkasan obrolan..."
+        "[Core] Updating chat summary..."
       );
       try {
         const fullHistory = await memory.getInMemoryHistory();
@@ -211,13 +236,13 @@ const setupCronJobs = (
           globalState.currentChatSummary = summary;
           logger.info(
             { event: "update_chat_summary_success" },
-            "[Core] Ringkasan obrolan terbaru berhasil dibuat."
+            "[Core] New chat summary created successfully."
           );
         } else {
           globalState.currentChatSummary = null;
           logger.info(
             { event: "update_chat_summary_no_summary" },
-            "[Core] Tidak ada ringkasan obrolan yang dibuat atau riwayat terlalu pendek."
+            "[Core] No chat summary was generated or history is too short."
           );
         }
       } catch (error) {
@@ -227,68 +252,84 @@ const setupCronJobs = (
             error: error.message,
             stack: error.stack,
           },
-          "Kesalahan saat memperbarui ringkasan obrolan:"
+          "Error while updating chat summary:"
         );
         Sentry.captureException(error);
       }
     }
   );
 
-  // Penjadwalan untuk sistem Ngambek (setiap hari pukul 00:00)
-  schedule.scheduleJob(
-    { rule: "0 0 * * *", tz: "Asia/Jakarta" },
-    async () => {
-      logger.info(
-        { event: "ngambek_status_check_scheduled" },
-        "[Ngambek System] Memeriksa status ngambek Lumina..."
-      );
-      try {
-        await checkNgambekStatus(configuredChatId);
-      } catch (error) {
-        logger.error(
-          {
-            event: "scheduled_ngambek_check_error",
-            error: error.message,
-            stack: error.stack,
-          },
-          "Kesalahan saat penjadwalan pengecekan status ngambek:"
-        );
-        Sentry.captureException(error);
-      }
-    }
-  );
-
-  // check hari libur dan kirim notifikasi jika hari libur (setiap jam 7 pagi)
-  if (config.calendarificApiKey) {
+  // Scheduler for the Sulk System (every day at midnight)
+  // FF-CHECK: This job is guarded by its feature flag.
+  if (isFeatureEnabled('ENABLE_SULK_MODE')) {
     schedule.scheduleJob(
-      { rule: "0 7 * * *", tz: "Asia/Jakarta" },
+      { rule: "0 0 * * *", tz: "Asia/Jakarta" },
       async () => {
+        logger.info(
+          { event: "sulk_status_check_scheduled" },
+          "[Sulk System] Checking sulk status..."
+        );
         try {
-          await holidaysModule.checkAndNotifyDailyHolidays(
-            config.calendarificApiKey,
-            "ID",
-            (message) => sendMessage(configuredChatId, message)
-          );
-          logger.info(
-            { event: "daily_holiday_check_scheduled" },
-            "Pengecekan hari libur harian dilakukan."
-          );
+          await checkSulkStatus(configuredChatId);
         } catch (error) {
           logger.error(
             {
-              event: "scheduled_holiday_check_error",
+              event: "scheduled_sulk_check_error",
               error: error.message,
               stack: error.stack,
             },
-            "Kesalahan saat penjadwalan pengecekan hari libur:"
+            "Error during scheduled sulk status check:"
           );
           Sentry.captureException(error);
         }
       }
     );
   } else {
-    logger.warn(
-      "[Core] Calendarific API Key tidak ditemukan. Pemeriksaan hari libur dinonaktifkan."
+    logger.info(
+        { event: "sulk_mode_disabled" },
+        "FF-CHECK: Sulk mode job is disabled by feature flag."
+    );
+  }
+
+  // Check for holidays and send a notification if it's a holiday (every morning at 7 AM)
+  // FF-CHECK: This job is guarded by its feature flag.
+  if (isFeatureEnabled('ENABLE_HOLIDAYS_REMINDER')) {
+    if (config.calendarificApiKey) {
+      schedule.scheduleJob(
+        { rule: "0 7 * * *", tz: "Asia/Jakarta" },
+        async () => {
+          try {
+            await holidaysModule.checkAndNotifyDailyHolidays(
+              config.calendarificApiKey,
+              "ID",
+              (message) => sendMessage(configuredChatId, message)
+            );
+            logger.info(
+              { event: "daily_holiday_check_scheduled" },
+              "Daily holiday check performed."
+            );
+          } catch (error) {
+            logger.error(
+              {
+                event: "scheduled_holiday_check_error",
+                error: error.message,
+                stack: error.stack,
+              },
+              "Error during scheduled holiday check:"
+            );
+            Sentry.captureException(error);
+          }
+        }
+      );
+    } else {
+      logger.warn(
+        "[Core] Calendarific API Key not found. Holiday check is disabled."
+      );
+    }
+  } else {
+    logger.info(
+      { event: "daily_holidays_check_disabled" },
+      "FF-CHECK: Holiday reminder job is disabled by feature flag."
     );
   }
 };

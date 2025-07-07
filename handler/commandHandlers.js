@@ -174,7 +174,7 @@ Saya Lumina, asisten virtual pribadi Anda. Saya di sini untuk membantu Anda deng
 Anda dapat berinteraksi dengan saya menggunakan bahasa alami atau menggunakan beberapa perintah cepat di bawah ini:
 
 - /help - Menampilkan pesan bantuan ini.
-- /cuaca - Mendapatkan informasi cuaca terkini.
+- /cuaca - Mendapatkan informasi cuaca terkini berdasarkan lokasi Anda.
 - /mood - Memeriksa suasana hati saya saat ini.
 - /note [pesan] - Menyimpan catatan singkat.
 - /shownotes - Menampilkan semua catatan Anda.
@@ -290,24 +290,52 @@ Jangan ragu untuk mencoba perintah atau sekadar mengobrol dengan saya! ${Mood.HA
     // --- Functional Commands ---
     {
         pattern: /^\/cuaca/i,
-        response: async (chatId) => {
+        response: async (chatId, msg) => {
             try {
                 await LuminaTyping(chatId);
-                const weatherCheckMessage = personalityMode === 'TSUNDERE' ?
-                    `Cuaca, ya? *Sigh* Baiklah, Aku akan cek cuacanya, Tunggu sebentar...` :
-                    `Baiklah, Tuan! Lumina akan mengecek cuacanya, Tunggu sebentar~`;
-                sendMessage(chatId, weatherCheckMessage);
-                const weather = await getWeatherData();
-                if (weather) {
-                    return {
-                        text: `Cuaca hari ini:\n${getWeatherString(weather)}\n${getWeatherReminder(weather)}`,
-                        mood: currentMood
-                    };
+                const userId = msg.from.id;
+                const userName = msg.from.first_name || USER_NAME;
+                
+                // Cek apakah lokasi pengguna sudah tersimpan di memori
+                const userLocation = await memory.getPreference(`user_location_${userId}`);
+
+                if (userLocation && userLocation.latitude && userLocation.longitude) {
+                    // Jika lokasi ada, langsung ambil data cuaca
+                    sendMessage(chatId, `Baik, ${userName}! Aku akan cek cuaca di lokasimu yang tersimpan...`);
+                    const weather = await getWeatherData(userLocation.latitude, userLocation.longitude);
+                    if (weather) {
+                        const weatherString = getWeatherString(weather);
+                        const weatherReminder = getWeatherReminder(weather, userName);
+                        return {
+                            text: `${weatherString}\n\n${weatherReminder}`,
+                            mood: currentMood
+                        };
+                    } else {
+                        return {
+                            text: `Maaf, Lumina tidak bisa menganalisis data cuaca untuk lokasimu yang tersimpan. ${Mood.SAD.emoji}`,
+                            mood: Mood.SAD
+                        };
+                    }
                 } else {
-                    return {
-                        text: `Maaf, Lumina tidak bisa menganalisis data cuaca. ${Mood.SAD.emoji}`,
-                        mood: Mood.SAD
-                    };
+                    // Jika lokasi tidak ada, minta pengguna untuk mengirim lokasi
+                    const requestMessage = "Kirim lokasimu dulu ya~ 📍\n\nTenang saja, lokasi Anda hanya akan digunakan untuk memberikan informasi cuaca dan tidak akan kami salahgunakan.";
+                    
+                    // Mengirim pesan dengan tombol permintaan lokasi
+                    botInstanceRef.sendMessage(chatId, requestMessage, {
+                        reply_markup: {
+                            keyboard: [
+                                [{
+                                    text: "📍 Kirim Lokasi Saat Ini",
+                                    request_location: true
+                                }]
+                            ],
+                            resize_keyboard: true,
+                            one_time_keyboard: true
+                        }
+                    });
+                    
+                    // Tidak mengembalikan teks karena pesan sudah dikirim langsung
+                    return { text: null }; 
                 }
             } catch (error) {
                 logger.error({ event: 'weather_command_error', error: error.message, stack: error.stack }, "Error in /cuaca command handler");
@@ -369,13 +397,13 @@ Jangan ragu untuk mencoba perintah atau sekadar mengobrol dengan saya! ${Mood.HA
             try {
                 const match = msg.text.match(/^\/search\s+(.+)$/i);
                 if (!match || !match[1]) {
-                    return { text: `Sorry, Master ${msg.from.first_name || ''}. The /search command format is incorrect.` };
+                    return { text: `Maaf, ${msg.from.first_name || ''}. The /search command format is incorrect.` };
                 }
                 const query = match[1].trim();
                 const userNameForCommand = msg.from.first_name || '';
                 
                 await LuminaTyping(chatId);
-                sendMessage(chatId, `Alright, Master ${userNameForCommand}. Lumina will search for "${query}" and try to summarize it... This might take a moment. ${getCurrentMood().emoji}`);
+                sendMessage(chatId, `Oke, ${userNameForCommand}. Lumina akan mencari tentang "${query}" dan mencoba merangkumnya... Tunggu sebentar! ${getCurrentMood().emoji}`);
                 
                 const searchResultText = await commandHelper.performSearch(
                     query,

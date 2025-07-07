@@ -1,5 +1,5 @@
 // core/core.js
-// MyLumina v1
+// MyLumina v1.2.3 (Optimized)
 // AUTHOR: Arash
 // TIKTOK: @rafardhancuy
 // Github: https://github.com/Rafacuy
@@ -7,150 +7,147 @@
 // TIME FORMAT: Asia/Jakarta - All time-based operations use Jakarta timezone.
 // MIT License
 
-// Notes:
-// This file serves as the main logics and message handling orchestrator for the MyLumina bot.
-// It manages incoming messages, dispatches them to appropriate handlers (e.g., document, image, text),
-// handles bot's internal state (like "mood" or "ngambek" mode), and interacts with various modules
-// for features like AI response generation, reminders, and long-term memory.
-// If you wish to use a different AI endpoint API, you might need to adjust the AI response generation
-// logic in 'ai-response.js' and configuration in 'config/config.js'.
-
 // ===== FILE IMPORTS =====
 
-// Configuration Import
-const config = require("../config/config"); // Imports configuration settings (API keys, tokens, chat IDs).
+// --- Core & Library Imports ---
+const { Mutex } = require("async-mutex"); 
+const Sentry = require("@sentry/node"); 
 
-// Memory Import
-const memory = require("../data/memory"); // Manages persistent data storage for the bot's memory.
+// --- Configuration Imports ---
+const config = require("../config/config");
+const { isFeatureEnabled } = require("../config/featureConfig");
 
-// Modules Import
-const weather = require("../modules/weather"); // Integrates weather fetching capabilities.
-const lists = require("../modules/commandLists"); // Contains definitions for various bot commands (e.g., search, help).
-const loveState = require("../modules/loveStateManager"); // Manages the bot's "romance mode" state and functions.
-const initTtsSchedules = require("../modules/ttsManager").initTtsSchedules; // Initializes text-to-speech (TTS) schedules, particularly for reminders.
-const ltmProcessor = require("../modules/ltmProcessor"); // Handles Long-Term Memory (LTM) processing and auto-detection.
-const ttsManager = require("../modules/ttsManager"); // Provides general text-to-speech functionalities.
-const Mood = require('../modules/mood')
+// --- Data Imports ---
+const memory = require("../data/memory");
+const globalState = require("../state/globalState");
 
-// Utilities Import
-const { sendMessage } = require("../utils/sendMessage"); // Utility for sending messages back to the user.
-const timeHelper = require("../utils/timeHelper"); // Helper functions for handling time, specifically for the Jakarta time zone.
-const chatFormatter = require("../utils/chatFormatter"); // Utility module for summarizing and formatting chat history.
-const { getUserName } = require("../utils/telegramHelper"); // Utility functions for retrieving user names from Telegram messages.
-const logger = require("../utils/logger"); // Logging utility based on the Pino library for structured logging.
-const { manageCache } = require("../utils/cacheHelper"); // Utility module for cache management functions.
+// --- Module Imports ---
+const weather = require("../modules/weather");
+const lists = require("../modules/commandLists");
+const loveState = require("../modules/loveStateManager");
+const { initTtsSchedules } = require("../modules/ttsManager");
+const ltmProcessor = require("../modules/ltmProcessor");
+const ttsManager = require("../modules/ttsManager");
+const Mood = require("../modules/mood");
 
-// Scheduler Imports
-const { setupCronJobs } = require("../scheduler/cronSetup"); // Configures and sets up scheduled tasks (cron jobs) for the bot.
-const updateTimeBasedModes = require("../scheduler/updateTimeModes"); // Module for updating bot's internal states like mood or time-based modes.
+// --- Utility Imports ---
+const { sendMessage } = require("../utils/sendMessage");
+const timeHelper = require("../utils/timeHelper");
+const chatFormatter = require("../utils/chatFormatter");
+const { getUserName } = require("../utils/telegramHelper");
+const logger = require("../utils/logger");
+const { manageCache } = require("../utils/cacheHelper");
 
-// State Import
-const globalState = require("../state/globalState"); // Manages global state variables accessible across different modules.
+// --- Scheduler Imports ---
+const { setupCronJobs } = require("../scheduler/cronSetup");
+const updateTimeBasedModes = require("../scheduler/updateTimeModes");
 
-// Handlers Import
-const contextManager = require("../handler/contextHandler"); // Handler for detecting message context and topics.
-const docHandler = require("../handler/docHandler"); // Handles incoming document messages.
-const commandHandlers = require("../handler/commandHandlers"); // Manages regular expression-based auto-reply commands.
-const relationState = require("../handler/relationHandler"); // Implements the bot's relationship system with the user.
-const visionHandler = require("../handler/visionHandler"); // Handles AI vision capabilities for image processing.
+// --- Handler Imports ---
+const contextManager = require("../handler/contextHandler");
+const docHandler = require("../handler/docHandler");
+const commandHandlers = require("../handler/commandHandlers");
+const relationState = require("../handler/relationHandler");
+const visionHandler = require("../handler/visionHandler");
 
-// Core AI Import
+// --- Core AI Import ---
 const {
   generateAIResponse,
   initialize: initializeAIResponseGenerator,
-} = require("./ai-response"); // Core module for generating AI responses based on prompts.
+} = require("./ai-response");
 
-const Sentry = require("@sentry/node"); // Sentry library for error tracking and debugging.
+// ===== GLOBAL STATE & OPTIMIZATION SETUP =====
+
+// Instantiate a Mutex to protect shared resources.
+const interactionMutex = new Mutex();
+
+// Structures to hold optimized command handlers.
+let commandMap = new Map(); // For O(1) lookup of prefixed commands (e.g., /help).
+let regexHandlers = []; // For iterating over more complex regex patterns.
 
 // Initialize globalState from memory on startup.
-// This ensures the bot's state is persistent across restarts.
 globalState.initializeFromMemory(
   memory,
   logger,
   commandHandlers.setPersonalityMode
 );
-// Store manageCache function in globalState for access from aiResponseGenerator.
-globalState.manageCache = manageCache;
+globalState.manageCache = manageCache; // Store manageCache for access from aiResponseGenerator.
 
 // Lumina bot configuration parameters.
-const MIN_CHATS_PER_DAY_TO_END_NGAMBEK = 6; // Minimum daily chats required to end "ngambek" (sulking) mode.
-const NGAMBEK_DURATION_DAYS = 2; // Duration in days after which Lumina enters "ngambek" mode if inactive.
-const END_NGAMBEK_INTERACTION_DAYS = 2; // Duration of active interaction (in days) required to end "ngambek" mode.
+const MIN_CHATS_PER_DAY_TO_END_NGAMBEK = 6;
+const NGAMBEK_DURATION_DAYS = 2;
+const END_NGAMBEK_INTERACTION_DAYS = 2;
 
 /**
- * Updates the user's interaction status (timestamp and daily chat count).
- * Uses a simple mutex to prevent race conditions during concurrent updates.
+ * Updates the user's interaction status using a proper mutex.
+ * This prevents race conditions when multiple messages arrive concurrently,
+ * ensuring data integrity for timestamps and chat counts.
  */
 const updateInteractionStatus = async () => {
-  // Check if the mutex is locked to prevent simultaneous updates.
-  if (globalState.interactionMutex) {
-    logger.warn(
-      { event: "update_interaction_status_skipped", reason: "mutex_locked" },
-      "Update interaction status skipped due to mutex lock."
-    );
-    return;
-  }
+  // Use the mutex to ensure this function runs exclusively.
+  // No other call to this function can start until the current one finishes.
+  await interactionMutex.runExclusive(async () => {
+    try {
+      const now = new Date();
+      globalState.lastInteractionTimestamp = now.toISOString();
+      const today = now.toISOString().slice(0, 10);
 
-  // Acquire the mutex lock.
-  globalState.interactionMutex = true;
+      const loadedCounts = await memory.getPreference("dailyChatCounts");
+      globalState.dailyChatCounts =
+        loadedCounts && typeof loadedCounts === "object" ? loadedCounts : {};
 
-  try {
-    const now = new Date();
-    // Update the last interaction timestamp to the current time.
-    globalState.lastInteractionTimestamp = now.toISOString();
-    // Get today's date in YYYY-MM-DD format for daily chat counts.
-    const today = now.toISOString().slice(0, 10);
+      if (!globalState.dailyChatCounts[today]) {
+        globalState.dailyChatCounts[today] = 0;
+      }
+      globalState.dailyChatCounts[today]++;
 
-    // Load existing daily chat counts from memory.
-    const loadedCounts = await memory.getPreference("dailyChatCounts");
-    // Ensure dailyChatCounts is an object, initialize if not.
-    globalState.dailyChatCounts =
-      loadedCounts && typeof loadedCounts === "object" ? loadedCounts : {};
-
-    // Initialize today's chat count if it doesn't exist.
-    if (!globalState.dailyChatCounts[today]) {
-      globalState.dailyChatCounts[today] = 0;
+      await memory.savePreference(
+        "lastInteractionTimestamp",
+        globalState.lastInteractionTimestamp
+      );
+      await memory.savePreference(
+        "dailyChatCounts",
+        globalState.dailyChatCounts
+      );
+      logger.info(
+        {
+          event: "interaction_status_updated",
+          todayChatCount: globalState.dailyChatCounts[today],
+        },
+        `[Interaction] Interaction status updated. Today's chats: ${globalState.dailyChatCounts[today]}.`
+      );
+    } catch (error) {
+      logger.error(
+        {
+          event: "update_interaction_status_error",
+          error: error.message,
+          stack: error.stack,
+        },
+        "Error updating interaction status:"
+      );
+      Sentry.captureException(error);
     }
-
-    // Increment today's chat count.
-    globalState.dailyChatCounts[today]++;
-
-    // Save the updated interaction timestamp and daily chat counts to memory.
-    await memory.savePreference(
-      "lastInteractionTimestamp",
-      globalState.lastInteractionTimestamp
-    );
-    await memory.savePreference("dailyChatCounts", globalState.dailyChatCounts);
-    logger.info(
-      {
-        event: "interaction_status_updated",
-        todayChatCount: globalState.dailyChatCounts[today],
-      },
-      `[Interaction] Interaction status updated. Today's chats: ${globalState.dailyChatCounts[today]}.`
-    );
-  } catch (error) {
-    logger.error(
-      {
-        event: "update_interaction_status_error",
-        error: error.message,
-        stack: error.stack,
-      },
-      "Error updating interaction status:"
-    );
-    Sentry.captureException(error); // Capture error with Sentry for monitoring.
-  } finally {
-    // Release the mutex lock.
-    globalState.interactionMutex = false;
-  }
+  });
 };
 
 /**
- * Checks Lumina's "Ngambek" (sulking/annoyed) status based on user interaction.
- * If there's no interaction for NGAMBEK_DURATION_DAYS, Lumina will enter "ngambek" mode.
- * If the user actively interacts for END_NGAMBEK_INTERACTION_DAYS, Lumina will return to normal.
+ * Checks Lumina's "Ngambek" status with a cleaner, more declarative approach.
+ * Instead of a manual `for` loop, it generates an array of required dates and uses `.every()`
+ * to verify if the interaction criteria are met for all of them.
  * @param {string} chatId - The chat ID to send notifications to.
  */
 const checkNgambekStatus = async (chatId) => {
+  if (!isFeatureEnabled("ENABLE_NGAMBEK_MODE")) {
+    if (globalState.isNgambekMode) {
+      globalState.isNgambekMode = false;
+      await memory.savePreference("isNgambekMode", false);
+      logger.info(
+        { event: "ngambek_mode_force_disabled" },
+        "[Ngambek System] Ngambek mode disabled by feature flag."
+      );
+    }
+    return;
+  }
+
   const now = new Date();
   const lastInteractionDate = globalState.lastInteractionTimestamp
     ? new Date(globalState.lastInteractionTimestamp)
@@ -159,14 +156,14 @@ const checkNgambekStatus = async (chatId) => {
   // --- Check if Lumina should enter 'ngambek' mode ---
   if (!globalState.isNgambekMode && lastInteractionDate) {
     const diffTime = Math.abs(now - lastInteractionDate);
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)); // Calculate difference in days.
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
     if (diffDays >= NGAMBEK_DURATION_DAYS) {
-      globalState.isNgambekMode = true; // Set ngambek mode to true.
-      commandHandlers.setMood(chatId, Mood.JEALOUS); // Set bot's mood to jealous (implies ngambek).
-      await memory.savePreference("isNgambekMode", true); // Persist ngambek mode state.
+      globalState.isNgambekMode = true;
+      commandHandlers.setMood(chatId, Mood.JEALOUS);
+      await memory.savePreference("isNgambekMode", true);
       logger.info(
-        { event: "ngambek_mode_activated", diffDays: diffDays },
+        { event: "ngambek_mode_activated", diffDays },
         "[Ngambek System] Lumina is now in Ngambek mode!"
       );
       sendMessage(
@@ -178,32 +175,29 @@ const checkNgambekStatus = async (chatId) => {
 
   // --- Check if Lumina should stop 'ngambek' mode ---
   if (globalState.isNgambekMode) {
-    let consecutiveActiveDays = 0;
-
-    // Iterate through recent days to check for active interaction.
-    for (let i = 0; i < END_NGAMBEK_INTERACTION_DAYS; i++) {
-      const date = new Date(now);
-      date.setDate(now.getDate() - i); // Go back i days from now.
-      const formattedDate = date.toISOString().slice(0, 10); // Format date as YYYY-MM-DD.
-
-      // Check if daily chat count for this day meets the minimum requirement.
-      if (
-        globalState.dailyChatCounts[formattedDate] >=
-        MIN_CHATS_PER_DAY_TO_END_NGAMBEK
-      ) {
-        consecutiveActiveDays++;
-      } else {
-        consecutiveActiveDays = 0; // Reset if any day doesn't meet the criteria.
-        break; // Exit loop if a non-qualifying day is found.
+    // Generate an array of date strings for the past N days.
+    const checkDates = Array.from(
+      { length: END_NGAMBEK_INTERACTION_DAYS },
+      (_, i) => {
+        const d = new Date(now);
+        d.setDate(now.getDate() - i);
+        return d.toISOString().slice(0, 10);
       }
-    }
+    );
 
-    // If enough consecutive active days are met, deactivate ngambek mode.
-    if (consecutiveActiveDays >= END_NGAMBEK_INTERACTION_DAYS) {
-      globalState.isNgambekMode = false; // Deactivate ngambek mode.
-      commandHandlers.setMood(chatId, commandHandlers.getRandomMood()); // Restore a random mood.
-      await memory.savePreference("isNgambekMode", false); // Persist ngambek mode state.
-      globalState.dailyChatCounts = {}; // Reset daily chat counts after ngambek ends.
+    // Use .every() for a clean, mathematical check. It returns true only if
+    // the condition is met for all items in the array.
+    const hasSufficientInteraction = checkDates.every(
+      (dateStr) =>
+        (globalState.dailyChatCounts[dateStr] || 0) >=
+        MIN_CHATS_PER_DAY_TO_END_NGAMBEK
+    );
+
+    if (hasSufficientInteraction) {
+      globalState.isNgambekMode = false;
+      commandHandlers.setMood(chatId, commandHandlers.getRandomMood());
+      await memory.savePreference("isNgambekMode", false);
+      globalState.dailyChatCounts = {}; // Reset counts
       await memory.savePreference(
         "dailyChatCounts",
         globalState.dailyChatCounts
@@ -221,24 +215,22 @@ const checkNgambekStatus = async (chatId) => {
 
   // --- Clean up old dailyChatCounts data ---
   const twoDaysAgo = new Date(now);
-  twoDaysAgo.setDate(now.getDate() - NGAMBEK_DURATION_DAYS - 1); // Define cutoff date for old data.
+  twoDaysAgo.setDate(now.getDate() - NGAMBEK_DURATION_DAYS - 1);
   for (const date in globalState.dailyChatCounts) {
     if (new Date(date) < twoDaysAgo) {
-      delete globalState.dailyChatCounts[date]; // Remove old entries.
+      delete globalState.dailyChatCounts[date];
     }
   }
-  await memory.savePreference("dailyChatCounts", globalState.dailyChatCounts); // Save cleaned data.
+  await memory.savePreference("dailyChatCounts", globalState.dailyChatCounts);
 };
 
 /**
  * Checks if the given string consists only of emojis.
- * Uses Unicode property escapes for comprehensive emoji detection.
  * @param {string} str - The input string to check.
  * @returns {boolean} True if the string contains only emojis, false otherwise.
  */
 function isOnlyEmojis(str) {
   if (typeof str !== "string") return false;
-  // Regex to match one or more Unicode emoji characters.
   const emojiRegex =
     /^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F|\p{Emoji_Modifier_Base}|\p{Emoji_Component})+$/u;
   return emojiRegex.test(str);
@@ -251,29 +243,22 @@ function isOnlyEmojis(str) {
  */
 function isOnlyNumbers(str) {
   if (typeof str !== "string") return false;
-  // Regex to match one or more digits from 0-9.
   const numberRegex = /^[0-9]+$/;
   return numberRegex.test(str);
 }
 
 /**
  * Analyzes the user's message to save preferences to long-term memory.
- * This is a modular and flexible version of LTM processing.
  * @param {string} text - The message text from the user.
  */
 const analyzeAndSavePreferences = async (text) => {
-  // Skip analysis if text is not a string or too short.
-  if (typeof text !== "string" || text.length < 10) {
-    return;
-  }
+  if (!isFeatureEnabled("ENABLE_LTM")) return;
+  if (typeof text !== "string" || text.length < 10) return;
 
   try {
-    // Process the text for LTM (Long-Term Memory) insights.
     const analysis = await ltmProcessor.processForLTM(text);
-
-    // If the analysis indicates that preferences should be saved.
     if (analysis.should_save_preferences) {
-      await ltmProcessor.saveLTMResult(analysis, text); // Save the LTM analysis result.
+      await ltmProcessor.saveLTMResult(analysis, text);
       logger.info(
         {
           priority: analysis.priorities_level,
@@ -287,38 +272,105 @@ const analyzeAndSavePreferences = async (text) => {
       { event: "ltm_processing_error", error: error.message },
       "Error in LTM processing pipeline"
     );
-    Sentry.captureException(error); // Capture error with Sentry.
+    Sentry.captureException(error);
   }
 };
 
 /**
- * Sets up the Telegram bot's message listener.
- * This function is separated to be called after the webhook server is ready,
- * ensuring all necessary components are initialized.
+ * Sets up the Telegram bot's message listener with optimized command handling.
  * @param {object} bot - The Telegram bot instance.
  */
 const setupMessageListener = (bot) => {
-  // Listen for all incoming messages from Telegram.
   bot.on("message", async (msg) => {
-    const { chat, text, photo, caption, from: senderInfo, document } = msg;
-    const currentMessageChatId = chat.id; // Get the ID of the current chat.
-    // Combine text and caption for user prompt, trim whitespace.
+    const {
+      chat,
+      text,
+      photo,
+      caption,
+      from: senderInfo,
+      document,
+      location,
+    } = msg;
+    const currentMessageChatId = chat.id;
     const userPromptText = (text || caption || "").trim();
+    const USER_NAME = getUserName(msg);
 
-    const USER_NAME = getUserName(msg); // Get the user's display name.
-
-    // --- Handle documents as a primary priority if present ---
-    if (document) {
+    // --- Location Message Handler ---
+    if (location) {
       try {
-        await updateInteractionStatus(); // Log this as an interaction.
-        
+        await updateInteractionStatus();
+        const userId = senderInfo.id;
+        const { latitude, longitude } = location;
+
+        if (!latitude || !longitude) {
+          logger.warn({ event: "invalid_location_received", userId });
+          sendMessage(
+            currentMessageChatId,
+            "Lokasi yang Anda kirim sepertinya tidak valid. Mohon coba lagi.",
+            { reply_markup: { remove_keyboard: true } }
+          );
+          return;
+        }
+
+        await memory.savePreference(`user_location_${userId}`, {
+          latitude,
+          longitude,
+        });
+        logger.info(
+          { event: "location_saved", userId },
+          `User location saved for weather.`
+        );
+
+        await commandHandlers.LuminaTyping(currentMessageChatId);
+        sendMessage(
+          currentMessageChatId,
+          "Oke, lokasi sudah disimpan! Aku akan carikan info cuacanya...",
+          { reply_markup: { remove_keyboard: true } }
+        );
+
+        const weatherData = await weather.getWeatherData(latitude, longitude);
+        if (weatherData) {
+          const weatherString = weather.getWeatherString(weatherData);
+          const weatherReminder = weather.getWeatherReminder(
+            weatherData,
+            USER_NAME
+          );
+          const fullResponse = `${weatherString}\n\n${weatherReminder}`;
+          sendMessage(currentMessageChatId, fullResponse);
+        } else {
+          sendMessage(
+            currentMessageChatId,
+            `Maaf, ${USER_NAME}, sepertinya Lumina tidak berhasil mendapatkan data cuaca untuk lokasi tersebut. Coba lagi nanti ya. ${Mood.SAD.emoji}`
+          );
+        }
+      } catch (error) {
+        logger.error(
+          {
+            event: "location_handler_error",
+            error: error.message,
+            stack: error.stack,
+          },
+          "Error handling location message."
+        );
+        Sentry.captureException(error);
+        sendMessage(
+          currentMessageChatId,
+          "Aduh, ada kesalahan teknis saat memproses lokasimu. Maaf ya."
+        );
+      }
+      return;
+    }
+
+    // --- Document Handler ---
+    if (document && isFeatureEnabled("ENABLE_DOC_HANDLER")) {
+      try {
+        await updateInteractionStatus();
         const aiDependencies = {
           generateAIResponse,
-          USER_NAME: getUserName(msg),
+          USER_NAME,
           Mood: commandHandlers.Mood,
         };
-
-        await docHandler.handleDocument(msg, bot, aiDependencies); // Teruskan dependensi
+        await docHandler.handleDocument(msg, bot, aiDependencies);
       } catch (error) {
         logger.error(
           { event: "document_core_handler_error", error: error.message },
@@ -330,22 +382,18 @@ const setupMessageListener = (bot) => {
           "Oops, Sepertinya ada kesalahan saat saya menganalisis dokumen, Tuan."
         );
       }
-      return; // Stop further processing for this message if it's a document.
+      return;
     }
 
-    // --- Handle photos (images) if present ---
-    if (photo && photo.length > 0) {
-      // Get the file ID of the largest photo (usually the last in the array).
+    // --- Vision (Image) Handler ---
+    if (photo && photo.length > 0 && isFeatureEnabled("ENABLE_AI_VISION")) {
       const fileId = photo[photo.length - 1].file_id;
       try {
-        // Get the downloadable link for the file.
         const fileLink = await bot.getFileLink(fileId);
         logger.info(
           { event: "image_received", fileId },
           `Image received, initiating VisionAgent flow...`
         );
-
-        // Process the image using the VisionHandler.
         const visionResult = await visionHandler.handleVisionRequest(
           fileLink,
           currentMessageChatId
@@ -353,14 +401,9 @@ const setupMessageListener = (bot) => {
 
         if (visionResult && visionResult.description) {
           logger.info(
-            {
-              event: "vision_success",
-              description: visionResult.description,
-            },
+            { event: "vision_success", description: visionResult.description },
             "VisionAgent successfully generated a description."
           );
-
-          // Add the message to memory, including the vision output.
           await memory.addMessage({
             role: "user",
             content: `[IMAGE SENT] ${userPromptText}`.trim(),
@@ -369,23 +412,20 @@ const setupMessageListener = (bot) => {
             timestamp: new Date(msg.date * 1000).toISOString(),
             context: {
               type: "image_input",
-              visionOutput: visionResult.description, // Store the AI-generated image description.
+              visionOutput: visionResult.description,
             },
           });
-
-          await commandHandlers.LuminaTyping(currentMessageChatId); // Simulate typing.
-
-          const messageContext = contextManager.analyzeMessage(msg); // Analyze message context.
-          // Generate AI response, passing vision description.
+          await commandHandlers.LuminaTyping(currentMessageChatId);
+          const messageContext = contextManager.analyzeMessage(msg);
           const aiResponse = await generateAIResponse(
             userPromptText,
             currentMessageChatId,
             messageContext,
-            USER_NAME, // Pass the user's name.
-            Mood, // Pass the Mood object.
-            visionResult.description // Pass the image description from VisionAgent.
+            USER_NAME,
+            Mood,
+            visionResult.description
           );
-          sendMessage(currentMessageChatId, aiResponse); // Send the AI response.
+          sendMessage(currentMessageChatId, aiResponse);
         } else {
           logger.warn(
             { event: "vision_failed" },
@@ -396,8 +436,7 @@ const setupMessageListener = (bot) => {
             `Maaf, tuan. Lumina sepertinya kesusahan untuk menganalisis gamabr tersebut. ${Mood.SAD.emoji}`
           );
         }
-
-        return; // Stop further processing for image messages.
+        return;
       } catch (error) {
         logger.error(
           { event: "process_image_error", error: error.message },
@@ -413,25 +452,23 @@ const setupMessageListener = (bot) => {
       }
     }
 
-    // --- General text message handling ---
-
-    // Ignore messages if there's no actual text content after trimming.
-    if (!userPromptText) return;
-
-    // Ignore messages that consist only of a single emoji or a single number.
+    // --- General Text Message Handling ---
     if (
-      userPromptText.length === 1 &&
-      (isOnlyEmojis(userPromptText) || isOnlyNumbers(userPromptText))
-    )
+      !userPromptText ||
+      (userPromptText.length === 1 &&
+        (isOnlyEmojis(userPromptText) || isOnlyNumbers(userPromptText)))
+    ) {
       return;
+    }
 
-    await relationState.addPointOnMessage(); // Add relationship points for interaction.
-    await updateInteractionStatus(); // Update interaction status.
-    await analyzeAndSavePreferences(userPromptText); // Analyze and save user preferences to LTM.
+    if (isFeatureEnabled("ENABLE_RELATIONSHIP_POINTS")) {
+      await relationState.addPointOnMessage();
+    }
 
-    const messageContext = contextManager.analyzeMessage(msg); // Analyze the message for its context.
+    await updateInteractionStatus();
+    await analyzeAndSavePreferences(userPromptText);
 
-    // Prepare user message object for storage.
+    const messageContext = contextManager.analyzeMessage(msg);
     const userMessageToStore = {
       role: "user",
       content: userPromptText,
@@ -442,9 +479,7 @@ const setupMessageListener = (bot) => {
       timestamp: new Date(msg.date * 1000).toISOString(),
       context: messageContext,
     };
-
-    await memory.addMessage(userMessageToStore); // Save the user message to memory.
-
+    await memory.addMessage(userMessageToStore);
     logger.info(
       {
         event: "user_message_saved",
@@ -454,10 +489,9 @@ const setupMessageListener = (bot) => {
       `User message saved to memory with context.`
     );
 
-    // --- Handle auto-reply messages ---
     if (messageContext.autoReply) {
-      await commandHandlers.LuminaTyping(currentMessageChatId); // Simulate typing.
-      sendMessage(currentMessageChatId, messageContext.autoReply); // Send the auto-reply.
+      await commandHandlers.LuminaTyping(currentMessageChatId);
+      sendMessage(currentMessageChatId, messageContext.autoReply);
       await memory.addMessage({
         role: "assistant",
         content: messageContext.autoReply,
@@ -465,19 +499,19 @@ const setupMessageListener = (bot) => {
         chatId: currentMessageChatId,
         context: { topic: messageContext.topic, tone: "auto_reply" },
       });
-      return; // Stop further processing after an auto-reply.
+      return;
     }
 
-    // --- Loop through custom command handlers ---
-    for (const handler of commandHandlers.commandHandlers) {
-      // Check if the user's message matches any defined command pattern.
-      if (handler.pattern.test(userPromptText)) {
-        await updateInteractionStatus(); // Mark as activity to prevent bot from "sulking".
+    // ===== COMMAND HANDLING LOGIC =====
+    let commandHandled = false;
 
-        // Execute the command handler's response function.
+    // Check for prefixed commands (e.g., /help) using the O(1) Map.
+    const commandMatch = userPromptText.match(/^\/(\w+)/);
+    if (commandMatch) {
+      const commandKey = commandMatch[1].toLowerCase();
+      if (commandMap.has(commandKey)) {
+        const handler = commandMap.get(commandKey);
         const result = await handler.response(currentMessageChatId, msg);
-
-        // If the handler returns text, send it and save to memory.
         if (result && result.text) {
           await commandHandlers.LuminaTyping(currentMessageChatId);
           sendMessage(currentMessageChatId, result.text);
@@ -488,81 +522,150 @@ const setupMessageListener = (bot) => {
             chatId: currentMessageChatId,
             context: {
               topic: "command_response",
-              command: handler.name || handler.pattern.source, // Log command name or regex pattern.
+              command: handler.name || commandKey,
             },
           });
         }
-
-        // If the handler suggests a mood change, set it.
         if (result && result.mood) {
           commandHandlers.setMood(currentMessageChatId, result.mood);
         }
-        return; // Stop processing after a command is handled.
+        commandHandled = true;
       }
     }
 
+    // If no prefixed command was handled, check the general regex handlers.
+    if (!commandHandled) {
+      for (const handler of regexHandlers) {
+        if (handler.pattern.test(userPromptText)) {
+          const result = await handler.response(currentMessageChatId, msg);
+          if (result && result.text) {
+            await commandHandlers.LuminaTyping(currentMessageChatId);
+            sendMessage(currentMessageChatId, result.text);
+            await memory.addMessage({
+              role: "assistant",
+              content: result.text,
+              timestamp: new Date().toISOString(),
+              chatId: currentMessageChatId,
+              context: {
+                topic: "command_response",
+                command: handler.name || handler.pattern.source,
+              },
+            });
+          }
+          if (result && result.mood) {
+            commandHandlers.setMood(currentMessageChatId, result.mood);
+          }
+          commandHandled = true;
+          break; // Exit after the first matching regex handler.
+        }
+      }
+    }
+
+    // If a command was handled by either method, stop further processing.
+    if (commandHandled) {
+      return;
+    }
+
     // --- Default AI response generation if no specific handlers apply ---
-    await commandHandlers.LuminaTyping(currentMessageChatId); // Simulate typing.
+    await commandHandlers.LuminaTyping(currentMessageChatId);
     const aiResponse = await generateAIResponse(
       userPromptText,
       currentMessageChatId,
       messageContext,
       USER_NAME,
-      commandHandlers.Mood // Pass the Mood object for AI context.
+      commandHandlers.Mood
     );
-    sendMessage(currentMessageChatId, aiResponse); // Send the AI-generated response.
+    sendMessage(currentMessageChatId, aiResponse);
   });
 };
 
 // ==== Module Exports & Bot Instance Management ====
 
 module.exports = {
-  // Export the generateAIResponse function for external use if needed.
   generateAIResponse,
   /**
-   * Initializes the MyLumina bot. This is the main entry point for starting the bot's operations.
+   * Initializes the MyLumina bot. This is the main entry point.
    * @param {object} bot - The instance of the Telegram bot client.
    */
   initLuminabot: (bot) => {
-    commandHandlers.setBotInstance(bot); // Set the bot instance in command handlers for sending messages.
-    // Determine the target chat ID from config, falling back to general chatId.
+    commandHandlers.setBotInstance(bot);
     const configuredChatId = config.TARGET_CHAT_ID || config.chatId;
 
-    logger.info(`🌸 MyNebula v1 (Virtual Assistant) is now running.`);
+    logger.info(`🌸 MyLumina v1 (Optimized) is now running.`);
+
+    // Initialize and categorize command handlers at startup.
+    // This separates commands into a fast map (for /commands) and a list (for regex)
+    // to avoid looping through every single handler on every message.
+    logger.info("Initializing and optimizing command handlers...");
+    // This regex identifies simple prefixed command patterns like `^/help` or `^/cuaca`.
+    const commandPrefixRegex = /^\^\\\/(\w+)/;
+
+    commandHandlers.commandHandlers.forEach((handler) => {
+      const patternString = handler.pattern.toString();
+      const match = patternString.match(commandPrefixRegex);
+
+      if (match && !patternString.includes("|")) {
+        // Ensure it's a simple command, not /cmd1|cmd2
+        // This is a simple, prefixed command. Add it to the map for O(1) lookup.
+        const commandKey = match[1].toLowerCase();
+        commandMap.set(commandKey, handler);
+        logger.info(
+          `[Optimizer] Mapped command for O(1) lookup: /${commandKey}`
+        );
+      } else {
+        // This is a more complex regex (e.g., contains '|' or doesn't start with '^/').
+        // Add it to the list for iteration.
+        regexHandlers.push(handler);
+        logger.info(
+          `[Optimizer] Added to regex list for iteration: ${patternString}`
+        );
+      }
+    });
+    logger.info("Command handler optimization complete.");
 
     // Initialize the AI response generator with all necessary dependencies.
     initializeAIResponseGenerator({
-      config, // Configuration settings.
-      memory, // Bot's memory module.
-      contextManager, // Context detection handler.
-      timeHelper, // Time utility functions.
-      commandHandlers, // Command execution handlers.
-      weather, // Weather module.
-      lists, // Command lists and other utilities.
-      relationState, // Relationship management system.
-      loveState, // Romance mode state.
-      ttsManager, // Text-to-speech manager.
-      chatFormatter, // Chat history formatter.
-      ltmProcessor, // Long-term memory processor.
-      visionHandler, // AI vision handler.
-      logger, // Logging utility.
-      globalState, // Global state variables.
-      sendMessageFunction: sendMessage, // Function to send messages.
+      config,
+      memory,
+      contextManager,
+      timeHelper,
+      commandHandlers,
+      weather,
+      lists,
+      relationState,
+      loveState,
+      ttsManager,
+      chatFormatter,
+      ltmProcessor,
+      visionHandler,
+      logger,
+      globalState,
+      sendMessageFunction: sendMessage,
     });
 
-    lists.rescheduleReminders(bot); // Reschedule any pending reminders on bot startup.
-    initTtsSchedules(bot); // Initialize TTS schedules for proactive announcements.
+    lists.rescheduleReminders(bot);
 
-    checkNgambekStatus(configuredChatId); // Perform initial check for "ngambek" status.
-    updateTimeBasedModes(configuredChatId); // Update time-based modes (e.g., daily greetings, mood changes).
+    if (isFeatureEnabled("ENABLE_TTS_REMINDER")) {
+      initTtsSchedules(bot);
+    }
 
-    // Set up all recurring cron jobs for background tasks.
-    setupCronJobs(
-      bot, // Pass the bot instance.
-      updateTimeBasedModes, // Function to update time-based modes.
-      checkNgambekStatus, // Function to check ngambek status periodically.
-      Sentry // Sentry for error reporting within cron jobs.
-    );
+    checkNgambekStatus(configuredChatId);
+    updateTimeBasedModes(configuredChatId);
+
+    if (isFeatureEnabled("ENABLE_CRON_JOBS")) {
+      setupCronJobs(
+        bot,
+        updateTimeBasedModes,
+        checkNgambekStatus,
+        configuredChatId,
+        Sentry
+      );
+    } else {
+      logger.warn(
+        { event: "cron_jobs_disabled" },
+        "Cron jobs are disabled by feature flag."
+      );
+    }
 
     // Set up the message listener after all other initializations are complete.
     setupMessageListener(bot);

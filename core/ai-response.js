@@ -1,8 +1,9 @@
 // DESCRIPTION: This file contains functions to handle AI responses and prompting for Lumina.
 
 // IMPORTS
-const Groq = require("groq-sdk");
-const Sentry = require("@sentry/node");
+const Groq = require("groq-sdk"); // Groq library package
+const Sentry = require("@sentry/node"); // Sentry for error-trace
+const { isFeatureEnabled } = require("../config/featureConfig"); // Feature Flags
 
 // These variables will be INJECTED from core.js to avoid circular dependency
 let config = {};
@@ -114,7 +115,11 @@ async function generateLuminaPrompt({
   }
 
   let basePrompt = `You are **Lumina**, ${USER_NAME}'s personal assistant and Virtual Assistant.`;
-  basePrompt += ` Your current relationship status with ${USER_NAME} is **${relationDescription}**. Adjust your speaking style based on this level.`;
+  
+  // FF-CHECK: Hanya tambahkan deskripsi hubungan jika fiturnya aktif.
+  if (isFeatureEnabled('ENABLE_RELATIONSHIP_POINTS')) {
+      basePrompt += ` Your current relationship status with ${USER_NAME} is **${relationDescription}**. Adjust your speaking style based on this level.`;
+  }
 
   let personalityPrompt = "";
   let examplePhrases = "";
@@ -221,9 +226,12 @@ const generateAIResponse = async (
   if (!messageContext || typeof messageContext !== "object") {
     messageContext = { topic: null };
   }
-
-  loveState.analyzeLoveTrigger(prompt);
-  loveState.resetRomanceStateIfNeeded();
+  
+  // FF-CHECK: Memeriksa apakah fitur Romance Mode diaktifkan sebelum memprosesnya.
+  if (isFeatureEnabled('ENABLE_ROMANCE_MODE')) {
+    loveState.analyzeLoveTrigger(prompt);
+    loveState.resetRomanceStateIfNeeded();
+  }
 
   const now = new Date();
   const currentHour = timeHelper.getJakartaHour();
@@ -245,7 +253,8 @@ const generateAIResponse = async (
     currentChatSummary: globalState.currentChatSummary,
     longTermMemory: globalState.loadedLongTermMemory,
     isNgambekMode: globalState.isNgambekMode,
-    isRomanceMode: loveState.getRomanceStatus(),
+    // FF-CHECK: Status romansa hanya aktif jika fitur diaktifkan DAN state-nya aktif.
+    isRomanceMode: isFeatureEnabled('ENABLE_ROMANCE_MODE') && loveState.getRomanceStatus(),
     botName: "Lumina",
     imageContext: imageDescription,
   });
@@ -304,7 +313,7 @@ const generateAIResponse = async (
     );
 
     const response = await client.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+      model: "meta-llama/llama-4-maverick-17b-128e-instruct",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: prompt },

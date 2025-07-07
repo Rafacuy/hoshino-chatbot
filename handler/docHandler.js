@@ -2,7 +2,6 @@
 // Handles incoming document messages from Telegram. It downloads the file,
 // processes it using a document reader module, and sends back a summary.
  
-
 const fs = require('fs').promises;
 const path = require('path');
 const axios = require('axios');
@@ -62,7 +61,7 @@ async function handleDocument(msg, bot, aiDependencies) {
     
     try {
         await ensureTempDir();
-        await sendMessage(chatId, `Reading file "${doc.file_name}"... Please wait a moment, Master.`);
+        await sendMessage(chatId, `Membaca file "${doc.file_name}"... Tunggu bentar yaa...`);
 
         // --- File Download ---
         const fileLink = await bot.getFileLink(doc.file_id);

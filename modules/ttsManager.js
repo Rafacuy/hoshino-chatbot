@@ -1,5 +1,5 @@
 // modules/ttsManager.js
-// Versi Lokal - Alya Voice Note
+// Local version 
 
 const schedule = require('node-schedule');
 const path = require('path');
@@ -45,6 +45,7 @@ const sendVoiceFromLocal = (bot, chatId, filename, caption) => {
         .then(() => console.log(`[TTS Manager] Voice note '${filename}' berhasil dikirim.`))
         .catch(err => console.error(`[TTS Manager] Gagal mengirim voice note '${filename}':`, err.message));
 };
+
 
 const initTtsSchedules = (bot) => {
     const chatId = config.TARGET_CHAT_ID || config.chatId;
