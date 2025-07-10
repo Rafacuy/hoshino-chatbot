@@ -1,0 +1,10 @@
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
+Ini adalah konten asli dari database_klien.sql
